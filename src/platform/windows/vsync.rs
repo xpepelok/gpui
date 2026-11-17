@@ -1,5 +1,6 @@
 use std::{
-    sync::LazyLock,
+    collections::HashMap,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
@@ -18,6 +19,47 @@ static QPC_TICKS_PER_SECOND: LazyLock<u64> = LazyLock::new(|| {
     unsafe { QueryPerformanceFrequency(&mut frequency).unwrap() };
     frequency as u64
 });
+
+static FRAME_REQUESTS: LazyLock<parking_lot::Mutex<HashMap<isize, Arc<crate::FrameRequest>>>> =
+    LazyLock::new(Default::default);
+
+static FRAME_SIGNAL: (parking_lot::Mutex<bool>, parking_lot::Condvar) =
+    (parking_lot::Mutex::new(true), parking_lot::Condvar::new());
+
+fn signal_frame_request() {
+    let mut pending = FRAME_SIGNAL.0.lock();
+    *pending = true;
+    FRAME_SIGNAL.1.notify_one();
+}
+
+pub(crate) fn wait_for_frame_request(timeout: Duration) -> bool {
+    let mut pending = FRAME_SIGNAL.0.lock();
+    if !*pending {
+        FRAME_SIGNAL.1.wait_for(&mut pending, timeout);
+    }
+    std::mem::replace(&mut *pending, false)
+}
+
+pub(crate) fn frame_request_flag(hwnd: HWND) -> Arc<crate::FrameRequest> {
+    let flag = FRAME_REQUESTS
+        .lock()
+        .entry(hwnd.0 as isize)
+        .or_insert_with(|| Arc::new(crate::FrameRequest::new(signal_frame_request)))
+        .clone();
+    signal_frame_request();
+    flag
+}
+
+pub(crate) fn take_frame_request(hwnd: HWND) -> bool {
+    FRAME_REQUESTS
+        .lock()
+        .get(&(hwnd.0 as isize))
+        .is_none_or(|flag| flag.take())
+}
+
+pub(crate) fn forget_frame_request(hwnd: HWND) {
+    FRAME_REQUESTS.lock().remove(&(hwnd.0 as isize));
+}
 
 const VSYNC_INTERVAL_THRESHOLD: Duration = Duration::from_millis(1);
 const DEFAULT_VSYNC_INTERVAL: Duration = Duration::from_micros(16_666); // ~60Hz

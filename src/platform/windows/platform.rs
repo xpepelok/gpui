@@ -28,6 +28,8 @@ use windows::{
 
 use crate::*;
 
+const IDLE_DEVICE_CHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
 pub(crate) struct WindowsPlatform {
     inner: Rc<WindowsPlatformInner>,
     raw_window_handles: Arc<RwLock<SmallVec<[SafeHwnd; 4]>>>,
@@ -248,7 +250,9 @@ impl WindowsPlatform {
             .spawn(move || {
                 let vsync_provider = VSyncProvider::new();
                 loop {
-                    vsync_provider.wait_for_vsync();
+                    if wait_for_frame_request(IDLE_DEVICE_CHECK) {
+                        vsync_provider.wait_for_vsync();
+                    }
                     if check_device_lost(&directx_device.device) {
                         handle_gpu_device_lost(
                             &mut directx_device,
@@ -262,8 +266,12 @@ impl WindowsPlatform {
                         break;
                     };
                     for hwnd in all_windows.read().iter() {
+                        let hwnd = hwnd.as_raw();
+                        if !take_frame_request(hwnd) {
+                            continue;
+                        }
                         unsafe {
-                            let _ = RedrawWindow(Some(hwnd.as_raw()), None, None, RDW_INVALIDATE);
+                            let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE);
                         }
                     }
                 }
@@ -734,6 +742,7 @@ impl WindowsPlatformInner {
             log::error!("Failed to upgrade raw window handles");
             return false;
         };
+        forget_frame_request(target_window);
         let mut lock = all_windows.write();
         let index = lock
             .iter()

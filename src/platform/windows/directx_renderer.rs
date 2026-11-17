@@ -30,6 +30,7 @@ pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSI
 const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
+const PATH_TARGETS_IDLE: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub(crate) struct FontInfo {
     pub gamma_ratios: [f32; 4],
@@ -57,17 +58,37 @@ pub(crate) struct DirectXRendererDevices {
     dxgi_device: Option<IDXGIDevice>,
 }
 
+#[derive(Clone)]
+struct PathTargets {
+    texture: ID3D11Texture2D,
+    srv: [Option<ID3D11ShaderResourceView>; 1],
+    msaa_texture: ID3D11Texture2D,
+    msaa_view: [Option<ID3D11RenderTargetView>; 1],
+}
+
+impl PathTargets {
+    fn new(device: &ID3D11Device, width: u32, height: u32) -> Result<Self> {
+        let (texture, srv) = create_path_intermediate_texture(device, width, height)?;
+        let (msaa_texture, msaa_view) =
+            create_path_intermediate_msaa_texture_and_view(device, width, height)?;
+        Ok(Self {
+            texture,
+            srv,
+            msaa_texture,
+            msaa_view,
+        })
+    }
+}
+
 struct DirectXResources {
     // Direct3D rendering objects
     swap_chain: IDXGISwapChain1,
     render_target: ManuallyDrop<ID3D11Texture2D>,
     render_target_view: [Option<ID3D11RenderTargetView>; 1],
 
-    // Path intermediate textures (with MSAA)
-    path_intermediate_texture: ID3D11Texture2D,
-    path_intermediate_srv: [Option<ID3D11ShaderResourceView>; 1],
-    path_intermediate_msaa_texture: ID3D11Texture2D,
-    path_intermediate_msaa_view: [Option<ID3D11RenderTargetView>; 1],
+    // Path intermediate textures (with MSAA), created on first use and dropped when idle
+    path_targets: Option<PathTargets>,
+    path_targets_used: std::time::Instant,
 
     // Cached window size and viewport
     width: u32,
@@ -285,6 +306,11 @@ impl DirectXRenderer {
 
     pub(crate) fn draw(&mut self, scene: &Scene) -> Result<()> {
         self.pre_draw()?;
+        if self.resources.path_targets.is_some()
+            && self.resources.path_targets_used.elapsed() > PATH_TARGETS_IDLE
+        {
+            self.resources.path_targets = None;
+        }
         for batch in scene.batches() {
             match batch {
                 PrimitiveBatch::Shadows(shadows) => self.draw_shadows(shadows),
@@ -400,18 +426,29 @@ impl DirectXRenderer {
             return Ok(());
         }
 
+        let targets = match &self.resources.path_targets {
+            Some(targets) => targets.clone(),
+            None => {
+                let targets = PathTargets::new(
+                    &self.devices.device,
+                    self.resources.width,
+                    self.resources.height,
+                )?;
+                self.resources.path_targets = Some(targets.clone());
+                targets
+            }
+        };
+        self.resources.path_targets_used = std::time::Instant::now();
+
         // Clear intermediate MSAA texture
         unsafe {
-            self.devices.device_context.ClearRenderTargetView(
-                self.resources.path_intermediate_msaa_view[0]
-                    .as_ref()
-                    .unwrap(),
-                &[0.0; 4],
-            );
+            self.devices
+                .device_context
+                .ClearRenderTargetView(targets.msaa_view[0].as_ref().unwrap(), &[0.0; 4]);
             // Set intermediate MSAA texture as render target
             self.devices
                 .device_context
-                .OMSetRenderTargets(Some(&self.resources.path_intermediate_msaa_view), None);
+                .OMSetRenderTargets(Some(&targets.msaa_view), None);
         }
 
         // Collect all vertices and sprites for a single draw call
@@ -443,9 +480,9 @@ impl DirectXRenderer {
         // Resolve MSAA to non-MSAA intermediate texture
         unsafe {
             self.devices.device_context.ResolveSubresource(
-                &self.resources.path_intermediate_texture,
+                &targets.texture,
                 0,
-                &self.resources.path_intermediate_msaa_texture,
+                &targets.msaa_texture,
                 0,
                 RENDER_TARGET_FORMAT,
             );
@@ -460,6 +497,9 @@ impl DirectXRenderer {
 
     fn draw_paths_from_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
         let Some(first_path) = paths.first() else {
+            return Ok(());
+        };
+        let Some(targets) = self.resources.path_targets.clone() else {
             return Ok(());
         };
 
@@ -494,7 +534,7 @@ impl DirectXRenderer {
         // Draw the sprites with the path texture
         self.pipelines.path_sprite_pipeline.draw_with_texture(
             &self.devices.device_context,
-            &self.resources.path_intermediate_srv,
+            &targets.srv,
             &self.resources.viewport,
             &self.globals.global_params_buffer,
             &self.globals.sampler,
@@ -671,25 +711,16 @@ impl DirectXResources {
             )?
         };
 
-        let (
-            render_target,
-            render_target_view,
-            path_intermediate_texture,
-            path_intermediate_srv,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            viewport,
-        ) = create_resources(devices, &swap_chain, width, height)?;
+        let (render_target, render_target_view, viewport) =
+            create_resources(devices, &swap_chain, width, height)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
 
         Ok(ManuallyDrop::new(Self {
             swap_chain,
             render_target,
             render_target_view,
-            path_intermediate_texture,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            path_intermediate_srv,
+            path_targets: None,
+            path_targets_used: std::time::Instant::now(),
             viewport,
             width,
             height,
@@ -703,21 +734,11 @@ impl DirectXResources {
         width: u32,
         height: u32,
     ) -> Result<()> {
-        let (
-            render_target,
-            render_target_view,
-            path_intermediate_texture,
-            path_intermediate_srv,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            viewport,
-        ) = create_resources(devices, &self.swap_chain, width, height)?;
+        let (render_target, render_target_view, viewport) =
+            create_resources(devices, &self.swap_chain, width, height)?;
         self.render_target = render_target;
         self.render_target_view = render_target_view;
-        self.path_intermediate_texture = path_intermediate_texture;
-        self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
-        self.path_intermediate_msaa_view = path_intermediate_msaa_view;
-        self.path_intermediate_srv = path_intermediate_srv;
+        self.path_targets = None;
         self.viewport = viewport;
         Ok(())
     }
@@ -1084,28 +1105,12 @@ fn create_resources(
 ) -> Result<(
     ManuallyDrop<ID3D11Texture2D>,
     [Option<ID3D11RenderTargetView>; 1],
-    ID3D11Texture2D,
-    [Option<ID3D11ShaderResourceView>; 1],
-    ID3D11Texture2D,
-    [Option<ID3D11RenderTargetView>; 1],
     [D3D11_VIEWPORT; 1],
 )> {
     let (render_target, render_target_view) =
         create_render_target_and_its_view(swap_chain, &devices.device)?;
-    let (path_intermediate_texture, path_intermediate_srv) =
-        create_path_intermediate_texture(&devices.device, width, height)?;
-    let (path_intermediate_msaa_texture, path_intermediate_msaa_view) =
-        create_path_intermediate_msaa_texture_and_view(&devices.device, width, height)?;
     let viewport = set_viewport(&devices.device_context, width as f32, height as f32);
-    Ok((
-        render_target,
-        render_target_view,
-        path_intermediate_texture,
-        path_intermediate_srv,
-        path_intermediate_msaa_texture,
-        path_intermediate_msaa_view,
-        viewport,
-    ))
+    Ok((render_target, render_target_view, viewport))
 }
 
 #[inline]

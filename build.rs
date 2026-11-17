@@ -345,12 +345,17 @@ mod windows {
             return path.trim().to_string();
         }
 
-        // Check the default path
-        if Path::new(r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe")
-            .exists()
-        {
-            return r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe"
-                .to_string();
+        let kits = Path::new(r"C:\Program Files (x86)\Windows Kits\10\bin");
+        let mut versions: Vec<PathBuf> = fs::read_dir(kits)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path().join("x64").join("fxc.exe"))
+            .filter(|path| path.exists())
+            .collect();
+        versions.sort();
+        if let Some(newest) = versions.pop() {
+            return newest.to_string_lossy().into_owned();
         }
 
         panic!("Failed to find fxc.exe");

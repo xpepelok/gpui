@@ -299,6 +299,36 @@ pub trait PlatformDisplay: Send + Sync + Debug {
     }
 }
 
+#[doc(hidden)]
+pub struct FrameRequest {
+    pending: std::sync::atomic::AtomicBool,
+    wake: fn(),
+}
+
+#[doc(hidden)]
+impl FrameRequest {
+    pub fn new(wake: fn()) -> Self {
+        Self {
+            pending: std::sync::atomic::AtomicBool::new(true),
+            wake,
+        }
+    }
+
+    pub fn request(&self) {
+        if !self
+            .pending
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            (self.wake)();
+        }
+    }
+
+    pub fn take(&self) -> bool {
+        self.pending
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+}
+
 /// Metadata for a given [ScreenCaptureSource]
 #[derive(Clone)]
 pub struct SourceMetadata {
@@ -499,6 +529,9 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn draw(&self, scene: &Scene);
     fn completed_frame(&self) {}
+    fn frame_request(&self) -> Option<Arc<FrameRequest>> {
+        None
+    }
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
 
     // macOS specific methods

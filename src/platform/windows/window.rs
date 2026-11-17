@@ -461,7 +461,7 @@ impl WindowsWindow {
         register_drag_drop(&this)?;
         configure_dwm_dark_mode(hwnd, appearance);
         this.state.borrow_mut().border_offset.update(hwnd)?;
-        let placement = retrieve_window_placement(
+        let mut placement = retrieve_window_placement(
             hwnd,
             display,
             params.bounds,
@@ -469,6 +469,9 @@ impl WindowsWindow {
             this.state.borrow().border_offset,
         )?;
         if params.show {
+            if !params.focus {
+                placement.showCmd = SW_SHOWNOACTIVATE.0 as u32;
+            }
             unsafe { SetWindowPlacement(hwnd, &placement)? };
         } else {
             this.state.borrow_mut().initial_placement = Some(WindowOpenStatus {
@@ -803,6 +806,10 @@ impl PlatformWindow for WindowsWindow {
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         self.0.state.borrow_mut().callbacks.request_frame = Some(callback);
+    }
+
+    fn frame_request(&self) -> Option<std::sync::Arc<FrameRequest>> {
+        Some(frame_request_flag(self.0.hwnd))
     }
 
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>) {
